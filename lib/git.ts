@@ -192,11 +192,74 @@ function readVarint(buf: Buffer, off: number): { value: number; next: number } {
 }
 
 /**
+ * Adler-32 of a buffer (the zlib trailer checksum). Chunked so the
+ * accumulators stay exact for any length (defer the modulo up to 5552
+ * bytes at a time, the standard NMAX bound).
+ */
+function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  let i = 0;
+  while (i < data.length) {
+    const end = Math.min(data.length, i + 5552);
+    for (; i < end; i += 1) {
+      a += data[i];
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/**
  * Inflate a deflate stream starting at `off` and find its exact length.
- * inflateSync ignores trailing bytes, so binary search finds the minimal
- * length whose inflate succeeds and yields the expected size.
+ *
+ * Fast path (no exceptions): inflateSync on the whole remainder inflates
+ * only the first zlib stream and ignores the trailing bytes. The stream's
+ * end is then the 4-byte Adler-32 trailer right after the deflate data, so
+ * a memchr for those bytes gives the consumed length; one verification
+ * inflate of the exact prefix proves the candidate (an accidental Adler
+ * match inside the deflate data is caught there). Anything unexpected
+ * falls back to the binary search below, which is the old behaviour.
  */
 function inflateAt(buf: Buffer, off: number, expectedSize: number): { data: Buffer; consumed: number } {
+  const rest = buf.subarray(off);
+  try {
+    const data = inflateSync(rest);
+    if (data.length === expectedSize) {
+      const adler = adler32(data);
+      const needle = Buffer.alloc(4);
+      needle.writeUInt32BE(adler, 0);
+      const pos = rest.indexOf(needle);
+      // A zlib stream for this output is at most expectedSize + 11 bytes
+      // (stored block: 5 bytes per 64 KiB + 2 header + 4 Adler).
+      const maxLen = expectedSize + 11 + Math.floor(expectedSize / 65535) * 5;
+      if (pos >= 0 && pos + 4 <= maxLen) {
+        const consumed = pos + 4;
+        try {
+          const check = inflateSync(rest.subarray(0, consumed));
+          if (check.length === expectedSize && check.equals(data)) {
+            return { data, consumed };
+          }
+        } catch {
+          // Candidate was a false positive; fall through to the search.
+        }
+      }
+    }
+  } catch {
+    // Remainder is not a complete stream at this offset; fall through.
+  }
+  return inflateAtSlow(buf, off, expectedSize);
+}
+
+/**
+ * The old length search: binary-search the minimal slice that inflates to
+ * the expected size. Correct but slow (each probe is an inflate, and the
+ * truncated ones throw). Only a fallback for the fast path above.
+ */
+function inflateAtSlow(buf: Buffer, off: number, expectedSize: number): { data: Buffer; consumed: number } {
   const max = buf.length - off;
   // Tight upper bound: a deflate stream is rarely longer than its output.
   let hi = Math.min(max, expectedSize + 64 + Math.floor(expectedSize / 100) + 16);

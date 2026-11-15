@@ -37,6 +37,17 @@ function isAuthorized(req: IncomingMessage): boolean {
   return token === expected;
 }
 
+function sendPrebuilt(res: ServerResponse, store: Store, status: number, body: Buffer, extraHeaders?: Record<string, string>): void {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-github-request-id': store.nextRequestId(),
+    'content-length': String(body.length),
+    ...(extraHeaders ?? {}),
+  };
+  res.writeHead(status, headers);
+  res.end(body);
+}
+
 function sendJson(res: ServerResponse, store: Store, status: number, json: unknown, extraHeaders?: Record<string, string>): void {
   const body = json === null ? Buffer.alloc(0) : Buffer.from(JSON.stringify(json), 'utf8');
   const headers: Record<string, string> = {
@@ -90,6 +101,8 @@ export function createApp(store = new Store()): Server {
         .split('/')
         .filter((s) => s !== '')
         .map((s) => {
+          // Most path segments are plain ASCII; only decode when escaped.
+          if (!s.includes('%')) return s;
           try {
             return decodeURIComponent(s);
           } catch {
@@ -208,6 +221,10 @@ export function createApp(store = new Store()): Server {
         if (result.status === 204) {
           res.writeHead(204, { 'x-github-request-id': store.nextRequestId() });
           res.end();
+          return;
+        }
+        if (result.body !== undefined) {
+          sendPrebuilt(res, store, result.status, result.body, result.headers);
           return;
         }
         sendJson(res, store, result.status, result.json, result.headers);

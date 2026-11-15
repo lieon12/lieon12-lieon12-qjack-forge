@@ -8,6 +8,7 @@
 
 import { flattenTree, parseCommit } from './git.ts';
 import { computeMergeable, mergeBaseOf, pullFilePaths, squashMerge } from './merge.ts';
+import { dropIssueJsonCache } from './rest.ts';
 import { FORGE_IDENTITY, trialNowSeconds, type Issue, type Pull, type Repo, type Store } from './store.ts';
 
 // ---------------------------------------------------------------------------
@@ -701,6 +702,7 @@ function doMutations(ctx: Ctx, selections: Selection[]): Record<string, unknown>
         }
         if (!found) throw new Error('issue not found');
         found.issue.state = 'closed';
+        dropIssueJsonCache(found.issue);
         const obj: Obj = { __type: 'MutationIssue', repo: found.repo, issue: found.issue };
         if (sel.selections) {
           const payload: Record<string, unknown> = {};

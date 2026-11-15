@@ -143,16 +143,25 @@ function lsRefsResponse(repo: Repo, prefixes: string[]): Buffer {
 }
 
 function fetchResponse(repo: Repo, req: FetchRequest, v2: boolean): Buffer {
+  // Full-response cache: an identical fetch (same version, wants, haves,
+  // shallow, depth) on an unchanged repo answers byte-identically, so the
+  // 50 concurrent shallow clones pay the traversal + framing only once.
+  // The response is deterministic (no clock, no randomness), and every
+  // mutation path clears fetchCache alongside packCache.
+  const cacheKey = JSON.stringify([v2 ? 2 : 0, req.wants, req.haves, req.shallow, req.depth ?? 0]);
+  const cached = repo.fetchCache.get(cacheKey);
+  if (cached) return cached;
   const plan = collectFetch(repo, req.wants, req.haves, req.shallow, req.depth);
   // Pack cache: identical fetch, identical pack (the 50 concurrent shallow
   // clones all fetch the same tip, so 49 of them reuse the first pack).
-  const cacheKey = JSON.stringify([req.wants, req.haves, req.shallow, req.depth ?? 0]);
-  let packBytes = repo.packCache.get(cacheKey);
+  const packKey = JSON.stringify([req.wants, req.haves, req.shallow, req.depth ?? 0]);
+  let packBytes = repo.packCache.get(packKey);
   if (!packBytes) {
     packBytes = writePack(repo, plan.send);
-    repo.packCache.set(cacheKey, packBytes);
+    repo.packCache.set(packKey, packBytes);
   }
 
+  let response: Buffer;
   if (v2) {
     const parts: Buffer[] = [];
     const ackLines: string[] = [];
@@ -181,23 +190,26 @@ function fetchResponse(repo: Repo, req: FetchRequest, v2: boolean): Buffer {
     parts.push(pktLines(['packfile\n']));
     parts.push(sidebandPackets(packBytes, 1));
     parts.push(FLUSH);
-    return Buffer.concat(parts);
-  }
-  // v0: NAK/ACK + shallow lines, then sideband pack packets, then flush.
-  const parts: Buffer[] = [];
-  let acked = false;
-  for (const h of req.haves) {
-    if (repo.objects.has(h)) {
-      parts.push(pktLine(`ACK ${h}\n`));
-      acked = true;
+    response = Buffer.concat(parts);
+  } else {
+    // v0: NAK/ACK + shallow lines, then sideband pack packets, then flush.
+    const parts: Buffer[] = [];
+    let acked = false;
+    for (const h of req.haves) {
+      if (repo.objects.has(h)) {
+        parts.push(pktLine(`ACK ${h}\n`));
+        acked = true;
+      }
     }
+    if (!acked) parts.push(pktLine('NAK\n'));
+    for (const s of plan.shallow) parts.push(pktLine(`shallow ${s}\n`));
+    for (const u of plan.unshallow) parts.push(pktLine(`unshallow ${u}\n`));
+    parts.push(sidebandPackets(packBytes, 1));
+    parts.push(FLUSH);
+    response = Buffer.concat(parts);
   }
-  if (!acked) parts.push(pktLine('NAK\n'));
-  for (const s of plan.shallow) parts.push(pktLine(`shallow ${s}\n`));
-  for (const u of plan.unshallow) parts.push(pktLine(`unshallow ${u}\n`));
-  parts.push(sidebandPackets(packBytes, 1));
-  parts.push(FLUSH);
-  return Buffer.concat(parts);
+  repo.fetchCache.set(cacheKey, response);
+  return response;
 }
 
 export function handleUploadPack(
@@ -301,6 +313,7 @@ export function handleReceivePack(
         if (!repo.objects.has(oid)) {
           repo.objects.set(oid, obj);
           repo.packCache.clear();
+          repo.fetchCache.clear();
         }
       }
     } catch (err) {
@@ -354,6 +367,7 @@ export function handleReceivePack(
       report.push({ ref: c.ref, ok: true, reason: '' });
     }
     repo.packCache.clear();
+    repo.fetchCache.clear();
   }
 
   const reportLines: Array<string | 'flush'> = [

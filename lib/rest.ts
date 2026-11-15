@@ -28,6 +28,8 @@ export interface RestResult {
   status: number;
   json: unknown;
   headers?: Record<string, string>;
+  /** Pre-serialized JSON body (issueJson cache); app.ts sends it as-is. */
+  body?: Buffer;
 }
 
 export interface RestContext {
@@ -47,8 +49,18 @@ const ok = (json: unknown, status = 200, headers?: Record<string, string>): Rest
 const err = (status: number, message: string): RestResult => ({ status, json: { message } });
 const notFound = (): RestResult => err(404, 'Not Found');
 
+let cachedNowSec = -1;
+let cachedNowIso = '';
 function nowIso(): string {
-  return new Date(trialNowSeconds() * 1000).toISOString();
+  // The trial clock is fixed for a whole trial (MAKEFUN_TRIAL_NOW or the
+  // constant), so the ISO string is computed once and reused: issueJson
+  // called it twice per issue, 2000 times in the read workload.
+  const sec = trialNowSeconds();
+  if (sec !== cachedNowSec) {
+    cachedNowSec = sec;
+    cachedNowIso = new Date(sec * 1000).toISOString();
+  }
+  return cachedNowIso;
 }
 
 function b64encodeId(kind: string, id: string): string {
@@ -105,6 +117,35 @@ function issueJson(store: Store, repo: Repo, issue: Issue): Record<string, unkno
     comments: issue.comments.length,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Per-issue serialized-response cache (read workload: the same issue is
+// GET 2000 times in a row). The cached bytes are valid only for the exact
+// viewer + clock they were built with, and every mutation path deletes the
+// entry — so a hit is byte-identical to rebuilding it.
+interface IssueJsonCacheEntry {
+  viewer: string;
+  now: string;
+  body: Buffer;
+}
+const issueJsonCache = new WeakMap<Issue, IssueJsonCacheEntry>();
+
+function issueJsonBytes(store: Store, repo: Repo, issue: Issue): Buffer {
+  const viewer = store.viewer();
+  const now = nowIso();
+  const cached = issueJsonCache.get(issue);
+  if (cached && cached.viewer === viewer && cached.now === now) return cached.body;
+  const body = Buffer.from(JSON.stringify(issueJson(store, repo, issue)), 'utf8');
+  issueJsonCache.set(issue, { viewer, now, body });
+  return body;
+}
+
+function dropIssueJsonCache(issue: Issue): void {
+  issueJsonCache.delete(issue);
+}
+
+/** Cross-module invalidation: GraphQL's closeIssue mutates an issue too. */
+export { dropIssueJsonCache };
 
 function pullJson(store: Store, repo: Repo, pull: Pull): Record<string, unknown> {
   return {
@@ -178,6 +219,7 @@ function commitOnBranch(
   );
   repo.refs.set(`refs/heads/${branch}`, commitOid);
   repo.packCache.clear();
+  repo.fetchCache.clear();
   return commitOid;
 }
 
@@ -287,6 +329,7 @@ export function handleRest(ctx: RestContext): RestResult {
         if (repo.refs.has(ref)) return err(422, 'ref already exists');
         repo.refs.set(ref, sha);
         repo.packCache.clear();
+        repo.fetchCache.clear();
         return ok(refJson(ref, sha), 201);
       }
       if (tail.length >= 4 && tail[2] === 'heads') {
@@ -457,7 +500,7 @@ export function handleRest(ctx: RestContext): RestResult {
             seq: repo.issues.length + 1,
           };
           repo.issues.push(issue);
-          return ok(issueJson(store, repo, issue), 201);
+          return { status: 201, json: null, body: issueJsonBytes(store, repo, issue) };
         }
         if (method === 'GET') {
           const state = ctx.query.get('state') ?? 'open';
@@ -475,13 +518,14 @@ export function handleRest(ctx: RestContext): RestResult {
       const issue = repo.issues.find((i) => i.number === issueNo);
       if (tail.length === 2) {
         if (!issue) return notFound();
-        if (method === 'GET') return ok(issueJson(store, repo, issue));
+        if (method === 'GET') return { status: 200, json: null, body: issueJsonBytes(store, repo, issue) };
         if (method === 'PATCH') {
           const b = bodyObj(ctx);
           if (b && (b.state === 'open' || b.state === 'closed')) issue.state = b.state;
           if (b && typeof b.title === 'string') issue.title = b.title;
           if (b && typeof b.body === 'string') issue.body = b.body;
-          return ok(issueJson(store, repo, issue));
+          dropIssueJsonCache(issue);
+          return { status: 200, json: null, body: issueJsonBytes(store, repo, issue) };
         }
         return notFound();
       }
@@ -495,6 +539,7 @@ export function handleRest(ctx: RestContext): RestResult {
           if (!b || typeof b.body !== 'string') return err(422, 'body is required');
           const comment = { id: repo.nextCommentId++, body: b.body, seq: repo.nextCommentId };
           issue.comments.push(comment);
+          dropIssueJsonCache(issue);
           return ok({ id: comment.id, body: comment.body, created_at: nowIso() }, 201);
         }
         return notFound();

@@ -63,7 +63,8 @@ export interface Repo {
   objects: Map<string, GitObject>;
   deflated: Map<string, Buffer>; // cached deflated loose-object bytes, per oid
   refs: Map<string, string>; // refname -> oid
-  packCache: Map<string, Buffer>; // fetch cache, keyed by want/have/depth
+  packCache: Map<string, Buffer>; // fetch pack cache, keyed by want/have/depth
+  fetchCache: Map<string, Buffer>; // full fetch RESPONSE cache (same key + version)
   issues: Issue[];
   pulls: Pull[];
   labels: Map<string, Label>;
@@ -132,6 +133,7 @@ export class Store {
       deflated: new Map(),
       refs: new Map(),
       packCache: new Map(),
+      fetchCache: new Map(),
       issues: [],
       pulls: [],
       labels: new Map(),
@@ -152,12 +154,13 @@ export class Store {
       .sort((a, b) => a.seq - b.seq);
   }
 
-  /** Store an object; returns its oid. Invalidates the fetch pack cache. */
+  /** Store an object; returns its oid. Invalidates the fetch caches. */
   putObject(repo: Repo, type: ObjType, data: Buffer): string {
     const oid = objectId(type, data);
     if (!repo.objects.has(oid)) {
       repo.objects.set(oid, { type, data });
       repo.packCache.clear();
+      repo.fetchCache.clear();
     }
     return oid;
   }

@@ -155,6 +155,7 @@ export function squashMerge(store: Store, repo: Repo, pull: Pull): SquashResult 
   const commitSha = put('commit', buildCommit(treeOid, [baseTip], who, who, pull.title));
   repo.refs.set(`refs/heads/${pull.base.ref}`, commitSha);
   repo.packCache.clear();
+  repo.fetchCache.clear();
   pull.state = 'closed';
   pull.merged = true;
   pull.merged_at = new Date(trialNowSeconds() * 1000).toISOString();
